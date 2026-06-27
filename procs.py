@@ -17,10 +17,6 @@ G = 9.8  # 重力 [m/s²]
 # KS 为受电弓–接触网之间的接触弹簧刚度 (接触界面参数), 不属于刚性接触网基础设施,
 # 故作为独立常量, 不并入接触网预设表.
 KS = 82300.0  # contact spring stiffness [N/m]
-
-# TOL_SUP 仅为接头布点的几何安全距离
-TOL_SUP = 1.5  # [m]
-
 # 瑞利阻尼(pc.m)
 ALPHA_C = 0.0124
 BETA_C = 0.0001
@@ -28,8 +24,7 @@ BETA_C = 0.0001
 # 通常 1–2 次收敛;
 CONTACT_ITERS_MAX = 5
 
-STABLE_START = 0.3
-STABLE_END = 0.7
+N_SKIP_SPANS = 6  # 稳定段剔除前/后跨数
 
 # 接触线波磨不平顺默认参数
 WEAR_AMPLITUDE = 1.0e-3  # 接触线磨耗幅值 A_w [m]，参考范围 [0.2, 3] mm, 间隔为0.2mm
@@ -100,30 +95,17 @@ def pantograph_params(ptype: int, v_kmh: float):
     """
     f_aero = 0.00047 * v_kmh**2
     table = {
-        1: (7.12, 6.00, 5.80, 9430.0, 14100.0, 0.1, 0, 0, 70.0, 120.0),  # DSA380
-        2: (7.51, 5.855, 4.645, 8380.0, 6200.0, 80.0, 0, 0, 70, 120.0),  # DSA250
+        1: (7.12, 6.00, 5.80, 9430.0, 14100.0, 0.1, 0, 0, 70.0, 100.0 + f_aero),  # DSA380
+        2: (7.51, 5.855, 4.645, 8380.0, 6200.0, 80.0, 0, 0, 70, 100.0 + f_aero),  # DSA250
+        3: (10.31, 6.15, 15.3, 53415.0, 6754.0, 400.0, 29.6, 0.2, 1.14, 100 + f_aero),  # TSG18F,
     }
     if ptype not in table:
         raise ValueError(f'PANTOGRAPH must be 1–2, the current value is {ptype}')
     return table[ptype]
 
 
-def compute_busbar_positions(LS: float, x_j: np.ndarray, l_mz: float, tol_sup: float = TOL_SUP) -> np.ndarray:
-    all_sup = np.concatenate([[0.0], x_j, [LS]])
-    x_mz = np.arange(l_mz, LS - l_mz / 2.0, l_mz, dtype=float)
-
-    for k in range(len(x_mz)):
-        dists = np.abs(x_mz[k] - all_sup)
-        idx = int(np.argmin(dists))
-        if dists[idx] < tol_sup:
-            violating = all_sup[idx]
-            x_mz[k] = violating + tol_sup if x_mz[k] >= violating else violating - tol_sup
-            # Extreme case: still in conflict → fall back to the midpoint of the enclosing span
-            if np.min(np.abs(x_mz[k] - all_sup)) < tol_sup:
-                below = all_sup[all_sup < x_mz[k]].max()
-                above = all_sup[all_sup > x_mz[k]].min()
-                x_mz[k] = 0.5 * (below + above)
-    return x_mz
+def compute_busbar_positions(LS: float, l_mz: float) -> np.ndarray:
+    return np.arange(2.0, LS - l_mz / 2.0, l_mz, dtype=float)
 
 
 def run_simulation(
@@ -194,7 +176,7 @@ def run_simulation(
     M_add_sup = MEQ * Phi_sup @ Phi_sup.T
     K_add_sup = KEQ * Phi_sup @ Phi_sup.T
 
-    x_mz = compute_busbar_positions(LS, x_j, l_mz=L_MZ)
+    x_mz = compute_busbar_positions(LS, l_mz=L_MZ)
     Phi_mz = norm_factor * np.sin(np.outer(modes * np.pi / LS, x_mz))  # (NM, Nmz)
     M_add_mz = MZ * Phi_mz @ Phi_mz.T
 
@@ -351,8 +333,9 @@ def run_simulation(
 
     stats_full = compute_stats(contact_force)
 
-    i_start = int(n_steps * STABLE_START)
-    i_end = int(n_steps * STABLE_END)
+    i_start = np.searchsorted(x_vec, N_SKIP_SPANS * L, side='left')
+    i_end = np.searchsorted(x_vec, LS - N_SKIP_SPANS * L, side='right')
+    stable_label = f'前{N_SKIP_SPANS}跨–后{N_SKIP_SPANS}跨'
     contact_force_stable = contact_force[i_start:i_end]
     x_stable = x_vec[i_start:i_end]
     y_panto_stable = y_pantograph[i_start:i_end]
@@ -360,7 +343,7 @@ def run_simulation(
     stats_stable = compute_stats(contact_force_stable)
 
     if verbose:
-        print(f'\n--- Contact force statistics (stable window {int(STABLE_START * 100)}%–{int(STABLE_END * 100)}%) ---')
+        print(f'\n--- Contact force statistics (stable window: {stable_label}) ---')
         for k, v in stats_stable.items():
             print(f'  {k:<28}: {v:.3f}')
         print()
@@ -378,6 +361,7 @@ def run_simulation(
         'y_rigid_overhead_contact_system_stable': y_cat_stable,
         'stats_full': stats_full,
         'stats_stable': stats_stable,
+        'stable_label': stable_label,
     }
 
 
@@ -414,8 +398,9 @@ def plot_results(
     图保存到 `out_dir`, 文件名按 (受电弓, 接触网, 速度) 区分.
     """
     cjk = _use_cjk_font()
+    stable_label = results.get('stable_label', f'前{N_SKIP_SPANS}跨–后{N_SKIP_SPANS}跨')
     if cjk:
-        col_titles = ('全部段', f'稳定段 ({int(STABLE_START * 100)}%–{int(STABLE_END * 100)}%)')
+        col_titles = ('全部段', f'稳定段 ({stable_label})')
         xlabel = '沿线位置 x [m]'
         rows = [
             ('弓网接触力 [N]', 'contact_force', 'contact_force_stable'),
@@ -424,7 +409,7 @@ def plot_results(
         ]
         sup = f'受电弓 {pantograph} · 接触网 {rigid_overhead_contact_system} · {int(round(speed_kmh))} km/h'
     else:
-        col_titles = ('Full run', f'Stable window ({int(STABLE_START * 100)}%–{int(STABLE_END * 100)}%)')
+        col_titles = ('Full run', f'Stable window ({stable_label})')
         xlabel = 'Position x [m]'
         rows = [
             ('Contact force [N]', 'contact_force', 'contact_force_stable'),
@@ -461,7 +446,90 @@ def plot_results(
     return fig_path
 
 
+def plot_initial_catenary_shape(
+    rigid_overhead_contact_system: int = RIGID_OVERHEAD_CONTACT_SYSTEM,
+    N_spans: int = 30,
+    NM_plot: int = NM,
+    out_dir: str | Path = './result/pc_plots',
+    show: bool = True,
+):
+    """绘制刚性接触网初始静力形态 (垂向位移), 标出悬挂点和中间接头位置."""
+    L, N, rhoA, EI, KEQ, MEQ, MZ, L_MZ = rigid_overhead_contact_system_params(rigid_overhead_contact_system, N_spans)
+    LS = L * N
+
+    modes = np.arange(1, NM_plot + 1, dtype=float)
+    norm_factor = np.sqrt(2.0 / (rhoA * LS))
+    omega_n = (modes * np.pi / LS) ** 2 * np.sqrt(EI / rhoA)
+
+    x_j = L * np.arange(1, N, dtype=float)
+    Phi_sup = norm_factor * np.sin(np.outer(modes * np.pi / LS, x_j))
+    M_add_sup = MEQ * Phi_sup @ Phi_sup.T
+    K_add_sup = KEQ * Phi_sup @ Phi_sup.T
+
+    x_mz = compute_busbar_positions(LS, l_mz=L_MZ)
+    Phi_mz = norm_factor * np.sin(np.outer(modes * np.pi / LS, x_mz))
+    M_add_mz = MZ * Phi_mz @ Phi_mz.T
+
+    M_cat = np.eye(NM_plot) + M_add_sup + M_add_mz
+    K_cat = np.diag(omega_n**2) + K_add_sup
+
+    int_sin = (LS / (modes * np.pi)) * (1.0 - np.cos(modes * np.pi))
+    F_grav_beam = -rhoA * G * norm_factor * int_sin
+    F_grav_sup = -MEQ * G * Phi_sup.sum(axis=1)
+    F_grav_mz = -MZ * G * Phi_mz.sum(axis=1)
+    F_gravity = F_grav_beam + F_grav_sup + F_grav_mz
+
+    q_static = np.linalg.solve(K_cat, F_gravity)
+
+    x_fine = np.linspace(0, LS, 2000)
+    phi_fine = norm_factor * np.sin(np.outer(modes * np.pi / LS, x_fine))
+    u_static = phi_fine.T @ q_static
+
+    all_sup = np.concatenate([[0.0], x_j, [LS]])
+    phi_sup_all = norm_factor * np.sin(np.outer(modes * np.pi / LS, all_sup))
+    u_sup_all = phi_sup_all.T @ q_static
+
+    phi_mz = norm_factor * np.sin(np.outer(modes * np.pi / LS, x_mz))
+    u_mz = phi_mz.T @ q_static
+
+    cjk = _use_cjk_font()
+    fig, ax = plt.subplots(figsize=(14, 5))
+    ax.plot(x_fine, u_static * 1e3, lw=1.2, color='C0', label='接触网垂向位移' if cjk else 'Catenary vertical disp.')
+
+    ax.scatter(
+        all_sup, u_sup_all * 1e3, color='red', s=50, zorder=5, marker='o', label='悬挂点' if cjk else 'Suspension point'
+    )
+    ax.scatter(
+        x_mz, u_mz * 1e3, color='green', s=50, zorder=5, marker='^', label='中间接头' if cjk else 'Mid-span joint'
+    )
+
+    ax.set_xlabel('沿线位置 x [m]' if cjk else 'Position x [m]')
+    ax.set_ylabel('垂向位移 [mm]' if cjk else 'Vertical disp. [mm]')
+    title = (
+        f'刚性接触网初始静力形态 (预设{rigid_overhead_contact_system}, 跨数={N}, 跨距={L} m)'
+        if cjk
+        else f'Initial catenary static shape (preset {rigid_overhead_contact_system}, spans={N}, span={L} m)'
+    )
+    ax.set_title(title)
+    ax.legend(loc='lower right')
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_path = out_dir / f'initial_catenary_shape_c{rigid_overhead_contact_system}.png'
+    fig.savefig(fig_path, dpi=150)
+    print(f'Figure saved → {fig_path}')
+    if show:
+        plt.show()
+    plt.close(fig)
+    return fig_path
+
+
 if __name__ == '__main__':
+    plot_initial_catenary_shape(
+        rigid_overhead_contact_system=RIGID_OVERHEAD_CONTACT_SYSTEM,
+    )
     results = run_simulation(
         rigid_overhead_contact_system=RIGID_OVERHEAD_CONTACT_SYSTEM,
         pantograph=PANTOGRAPH,
